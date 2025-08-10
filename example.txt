@@ -1,0 +1,11 @@
+Initial Position
+Wes Taxable
+GRAL
+2025-04-01
+499.99
+20.193
+
+Sold
+2025-04-24
+499.94
+6.222 retained
