@@ -9,3 +9,8 @@ Sold
 2025-04-24
 499.94
 6.222 retained
+
+
+
+When i bought more ELF it did not go away from buy_more_recommendations.
+Need to make it so that the lowest entry for a particular account/ticker is what it adds its recommendation to and ignores the others.

@@ -139,7 +139,7 @@ def rebuild_inflections(conn, tickers, lookback_days=450):
                 prior_inflections = [inf for j, inf in enumerate(
                     inflections[:idx]) if inf[1] >= window_start and inf[0] == type_]
                 if not prior_inflections:
-                    target_change = 0.05
+                    target_change = -0.05 if type_ == 'low' else 0.05
                 else:
                     prior_changes = []
                     opp_type = 'high' if type_ == 'low' else 'low'
@@ -153,8 +153,9 @@ def rebuild_inflections(conn, tickers, lookback_days=450):
                             change = ((next_price - p_price) / p_price) if type_ == 'low' else abs(
                                 (next_price - p_price) / p_price)
                             prior_changes.append(change)
-                    target_change = np.mean(
+                    mean_change = np.mean(
                         prior_changes) if prior_changes else 0.05
+                    target_change = -mean_change if type_ == 'low' else mean_change
 
                 inserted = insert_inflection_row(
                     conn, ticker, date, type_, price, close, target_change)
@@ -177,7 +178,7 @@ def update_target_price(conn):
         query = """
             UPDATE stocks.public.ticker_inflections
             SET target_price = CASE
-                WHEN type = 'low' THEN ROUND(close * (1 + target_change), 4)
+                WHEN type = 'low' THEN ROUND(close * (1 - target_change), 4)  -- Since target_change is negative for low, - negative = +
                 WHEN type = 'high' THEN ROUND(close * (1 - target_change), 4)
                 ELSE NULL
             END,

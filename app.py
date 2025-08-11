@@ -4,6 +4,9 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, date
 
+# Set wide layout for better screen utilization
+st.set_page_config(layout="wide")
+
 # DB engine (SQLAlchemy)
 engine = sa.create_engine(
     'postgresql+psycopg2://stock_user:master@localhost/stocks')
@@ -15,27 +18,6 @@ def fetch_tickers():
     with engine.connect() as conn:
         df = pd.read_sql(
             "SELECT ticker, golden, notes FROM stocks.public.interested_tickers ORDER BY ticker;", conn)
-    return df
-
-# Fetch stock data for a ticker (historical)
-
-
-def fetch_stock_data(ticker):
-    with engine.connect() as conn:
-        df = pd.read_sql("""
-            SELECT date, open, high, low, close, volume 
-            FROM stocks.public.stock_data 
-            WHERE ticker = %s ORDER BY date DESC LIMIT 30;
-        """, conn, params=(ticker,))
-    return df
-
-# Fetch current prices
-
-
-def fetch_current_prices():
-    with engine.connect() as conn:
-        df = pd.read_sql(
-            "SELECT * FROM stocks.public.current_prices ORDER BY ticker;", conn)
     return df
 
 # Populate current prices (truncate and reload)
@@ -89,6 +71,16 @@ def add_ticker(ticker, golden, notes):
                 ON CONFLICT (ticker) DO UPDATE SET golden = EXCLUDED.golden, notes = EXCLUDED.notes;
             """), {'ticker': ticker.upper(), 'golden': golden, 'notes': notes})
 
+# Delete ticker by ticker symbol
+
+
+def delete_ticker(ticker):
+    with engine.connect() as conn:
+        with conn.begin():
+            conn.execute(sa.text("""
+                DELETE FROM stocks.public.interested_tickers WHERE ticker = :ticker;
+            """), {'ticker': ticker})
+
 # Fetch accounts
 
 
@@ -110,6 +102,37 @@ def add_position(account, ticker, buy_date, invested_amount, shares, notes):
             """), {'account': account, 'ticker': ticker.upper(), 'buy_date': buy_date,
                    'invested_amount': round(invested_amount, 2), 'shares': shares,
                    'notes': notes})
+
+# Fetch exclusions
+
+
+def fetch_exclusions():
+    with engine.connect() as conn:
+        df = pd.read_sql(
+            "SELECT id, account, ticker, notes, created_at, updated_at FROM stocks.public.account_ticker_exclusions ORDER BY account, ticker;", conn)
+    return df
+
+# Add exclusion
+
+
+def add_exclusion(account, ticker, notes):
+    with engine.connect() as conn:
+        with conn.begin():
+            conn.execute(sa.text("""
+                INSERT INTO stocks.public.account_ticker_exclusions (account, ticker, notes) 
+                VALUES (:account, :ticker, :notes) 
+                ON CONFLICT (account, ticker) DO UPDATE SET notes = EXCLUDED.notes;
+            """), {'account': account, 'ticker': ticker.upper(), 'notes': notes})
+
+# Delete exclusion by ID
+
+
+def delete_exclusion(exclusion_id):
+    with engine.connect() as conn:
+        with conn.begin():
+            conn.execute(sa.text("""
+                DELETE FROM stocks.public.account_ticker_exclusions WHERE id = :id;
+            """), {'id': exclusion_id})
 
 
 # Streamlit app
@@ -133,51 +156,74 @@ with st.sidebar:
             add_ticker(new_ticker, golden, notes)
             st.success(f"Added {new_ticker}")
 
-# Display tickers
-tickers_df = fetch_tickers()
-st.header("Interested Tickers")
-st.dataframe(tickers_df.style.apply(
-    lambda row: ['background: gold' if row.golden else ''] * len(row), axis=1))
-
-# Current prices section
-st.header("Current Prices")
+# Refresh Current Prices button
+st.header("Current Prices Management")
 if st.button("Refresh Current Prices"):
     with st.spinner("Refreshing current prices..."):
         inserted = populate_current_prices()
         st.success(f"Updated current prices for {inserted} tickers")
-current_df = fetch_current_prices()
-if not current_df.empty:
-    st.dataframe(current_df)
+
+# Manage Tickers section (for removal)
+st.header("Manage Interested Tickers")
+tickers_df = fetch_tickers()
+if not tickers_df.empty:
+    st.dataframe(tickers_df)
+
+    # Delete tickers
+    selected_tickers = st.multiselect(
+        "Select Tickers to Delete", tickers_df['ticker'].tolist())
+    if st.button("Delete Selected Tickers"):
+        for ticker in selected_tickers:
+            delete_ticker(ticker)
+        st.success(f"Deleted {len(selected_tickers)} ticker(s)")
+        st.rerun()  # Refresh the page to show updated list
 else:
-    st.info("No current prices loaded yet.")
+    st.info("No interested tickers yet.")
 
-# Select ticker for details
-selected_ticker = st.selectbox("View Data For", tickers_df['ticker'])
-if selected_ticker:
-    data_df = fetch_stock_data(selected_ticker)
-    if not data_df.empty:
-        st.subheader(f"Recent 30 Days for {selected_ticker}")
-        st.dataframe(data_df)
-    else:
-        st.info("No historical data yet—run the download script.")
+# Buy Initial Position Recommendations section
+st.header("Buy Initial Position Recommendations")
+buy_initial_df = pd.read_sql(
+    "SELECT * FROM stocks.public.buy_initial_position_recommendations ORDER BY account, ticker;", engine)
+if not buy_initial_df.empty:
+    st.dataframe(buy_initial_df)
 
-    # Current details for selected ticker
-    if not current_df.empty:
-        row = current_df[current_df['ticker'] == selected_ticker]
-        if not row.empty:
-            st.subheader(f"Current Details for {selected_ticker}")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Current Price",
-                        f"${row['current_price'].values[0]:.2f}")
-            col2.metric(
-                "Day High", f"${row['day_high'].values[0]:.2f}" if row['day_high'].values[0] else "N/A")
-            col3.metric(
-                "Day Low", f"${row['day_low'].values[0]:.2f}" if row['day_low'].values[0] else "N/A")
-            st.metric(
-                "Volume", f"{row['volume'].values[0]:,}" if row['volume'].values[0] else "N/A")
-            st.caption(f"Last updated: {row['last_updated'].values[0]}")
-        else:
-            st.info("No current data for this ticker—refresh above.")
+    # Interaction: Select a recommendation to pre-fill Add Position
+    rec_options = [f"{row['account']} - {row['ticker']}" for _,
+                   row in buy_initial_df.iterrows()]
+    selected_rec = st.selectbox(
+        "Select Recommendation to Buy Initial Position", options=rec_options, index=0)
+    if st.button("Proceed to Add Position for Selected Initial"):
+        if selected_rec:
+            account, ticker = selected_rec.split(' - ')
+            # Reusing the same keys for pre-fill
+            st.session_state.buy_more_account = account
+            st.session_state.buy_more_ticker = ticker
+            st.success(
+                f"Pre-filled Add Position with {account} - {ticker}. Scroll down to complete.")
+else:
+    st.info("No buy initial position recommendations at this time.")
+
+# Buy More Recommendations section
+st.header("Buy More Recommendations")
+buy_more_df = pd.read_sql(
+    "SELECT * FROM stocks.public.buy_more_recommendations ORDER BY account, ticker;", engine)
+if not buy_more_df.empty:
+    st.dataframe(buy_more_df)
+
+    # Interaction: Select a recommendation to pre-fill Add Position
+    rec_options = [f"{row['account']} - {row['ticker']}" for _,
+                   row in buy_more_df.iterrows()]
+    selected_rec = st.selectbox(
+        "Select Recommendation to Buy More", options=rec_options, index=0)
+    if st.button("Proceed to Add Position for Selected"):
+        if selected_rec:
+            account, ticker = selected_rec.split(' - ')
+            st.session_state.buy_more_account = account
+            st.session_state.buy_more_ticker = ticker
+            st.success(
+                f"Pre-filled Add Position with {account} - {ticker}. Scroll down to complete.")
+else:
+    st.info("No buy more recommendations at this time.")
 
 # Add Position section
 st.header("Add Position")
@@ -185,9 +231,23 @@ accounts_df = fetch_accounts()
 if accounts_df.empty:
     st.info("No accounts available. Please add accounts to the database.")
 else:
-    position_ticker = st.selectbox("Ticker", tickers_df['ticker'].tolist())
+    ticker_options = tickers_df['ticker'].tolist()
     account_options = accounts_df['account_name'].tolist()
-    selected_account = st.selectbox("Account", account_options)
+
+    # Pre-fill if from buy more or initial
+    pre_ticker = st.session_state.get('buy_more_ticker', None)
+    pre_account = st.session_state.get('buy_more_account', None)
+
+    ticker_index = ticker_options.index(
+        pre_ticker) if pre_ticker and pre_ticker in ticker_options else 0
+    position_ticker = st.selectbox(
+        "Ticker", ticker_options, index=ticker_index)
+
+    account_index = account_options.index(
+        pre_account) if pre_account and pre_account in account_options else 0
+    selected_account = st.selectbox(
+        "Account", account_options, index=account_index)
+
     buy_date = st.date_input("Buy Date", value=date.today())
     invested_amount = st.number_input(
         "Invested Amount", min_value=0.0, step=0.01)
@@ -199,5 +259,48 @@ else:
                          buy_date, invested_amount, shares, position_notes)
             st.success(
                 f"Added position for {position_ticker} in {selected_account}")
+            # Clear pre-fill session state
+            if 'buy_more_account' in st.session_state:
+                del st.session_state.buy_more_account
+            if 'buy_more_ticker' in st.session_state:
+                del st.session_state.buy_more_ticker
+            st.rerun()  # Auto-refresh to update recommendations
         else:
             st.error("Please fill in all required fields.")
+
+# Manage Exclusions section
+st.header("Manage Account-Ticker Exclusions")
+exclusions_df = fetch_exclusions()
+if not exclusions_df.empty:
+    st.subheader("Current Exclusions")
+    st.dataframe(exclusions_df)
+
+    # Delete exclusions
+    selected_ids = st.multiselect(
+        "Select Exclusions to Delete (by ID)", exclusions_df['id'].tolist())
+    if st.button("Delete Selected Exclusions"):
+        for exclusion_id in selected_ids:
+            delete_exclusion(exclusion_id)
+        st.success(f"Deleted {len(selected_ids)} exclusion(s)")
+        st.rerun()  # Refresh the page to show updated list
+
+else:
+    st.info("No exclusions yet.")
+
+# Add new exclusion
+st.subheader("Add Exclusion")
+if accounts_df.empty:
+    st.info("No accounts available. Please add accounts to the database.")
+else:
+    exclusion_account = st.selectbox("Account for Exclusion", account_options)
+    exclusion_ticker = st.selectbox(
+        "Ticker for Exclusion", tickers_df['ticker'].tolist())
+    exclusion_notes = st.text_area("Exclusion Notes")
+    if st.button("Add Exclusion"):
+        if exclusion_account and exclusion_ticker:
+            add_exclusion(exclusion_account, exclusion_ticker, exclusion_notes)
+            st.success(
+                f"Added exclusion for {exclusion_account} - {exclusion_ticker}")
+            st.rerun()  # Refresh to show updated list
+        else:
+            st.error("Please select an account and ticker.")
