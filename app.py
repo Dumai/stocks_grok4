@@ -90,18 +90,187 @@ def fetch_accounts():
             "SELECT account_name FROM stocks.public.accounts ORDER BY account_name;", conn)
     return df
 
-# Add new position
+# Updated add_position to support original_position_id
 
 
-def add_position(account, ticker, buy_date, invested_amount, shares, notes):
+def add_position(account, ticker, buy_date, invested_amount, shares, notes, profit_position=False, original_position_id=None):
     with engine.connect() as conn:
         with conn.begin():
             conn.execute(sa.text("""
-                INSERT INTO stocks.public.open_positions (account, ticker, buy_date, invested_amount, shares, notes) 
-                VALUES (:account, :ticker, :buy_date, :invested_amount, :shares, :notes);
+                INSERT INTO stocks.public.open_positions (account, ticker, buy_date, invested_amount, shares, notes, profit_position, original_position_id) 
+                VALUES (:account, :ticker, :buy_date, :invested_amount, :shares, :notes, :profit_position, :original_position_id);
             """), {'account': account, 'ticker': ticker.upper(), 'buy_date': buy_date,
                    'invested_amount': round(invested_amount, 2), 'shares': shares,
-                   'notes': notes})
+                   'notes': notes, 'profit_position': profit_position, 'original_position_id': original_position_id})
+
+# Updated sell_position to set original_position_id on new profit position
+
+
+def sell_position(position_id, sell_date, sell_amount, shares_sold):
+    with engine.connect() as conn:
+        with conn.begin():
+            # Fetch original position details
+            orig_df = pd.read_sql(sa.text("""
+                SELECT account, ticker, buy_date, invested_amount, shares, notes, profit_position
+                FROM stocks.public.open_positions WHERE id = :id;
+            """), conn, params={'id': position_id})
+            if orig_df.empty:
+                raise ValueError("Position not found")
+            orig = orig_df.iloc[0]
+            total_shares = float(orig['shares'])
+            invested_amount = float(orig['invested_amount'])
+            is_profit_position = orig['profit_position']
+
+            if shares_sold > total_shares or shares_sold <= 0:
+                raise ValueError("Invalid shares sold")
+
+            # Calculate proportional invested for sold portion
+            prop_invested = invested_amount * (shares_sold / total_shares)
+
+            # Check if sell_amount is within 5% of original invested_amount
+            within_5pct = abs(sell_amount - invested_amount) / \
+                invested_amount <= 0.05 if invested_amount != 0 else False
+
+            if within_5pct:
+                closed_invested = sell_amount
+                remaining_invested = invested_amount - sell_amount
+                new_profit_position = True
+            else:
+                if is_profit_position:
+                    closed_invested = 0.0
+                    remaining_invested = invested_amount - sell_amount
+                    new_profit_position = True
+                else:
+                    closed_invested = prop_invested
+                    remaining_invested = invested_amount - prop_invested
+                    new_profit_position = False
+
+            # Round for storage
+            closed_invested = round(closed_invested, 2)
+            if 'remaining_invested' in locals():
+                remaining_invested = round(remaining_invested, 2)
+
+            # Insert into closed_positions
+            conn.execute(sa.text("""
+                INSERT INTO stocks.public.closed_positions 
+                (account, ticker, buy_date, invested_amount, shares, sell_date, sell_amount, shares_retained, profit_position, original_position_id)
+                VALUES (:account, :ticker, :buy_date, :invested_amount, :shares, :sell_date, :sell_amount, :shares_retained, :profit_position, :orig_id);
+            """), {
+                'account': orig['account'], 'ticker': orig['ticker'], 'buy_date': orig['buy_date'],
+                'invested_amount': closed_invested, 'shares': float(shares_sold),
+                'sell_date': sell_date, 'sell_amount': round(float(sell_amount), 2),
+                'shares_retained': float(total_shares - shares_sold), 'profit_position': False,
+                'orig_id': position_id
+            })
+
+            # If partial sell, create new open_position for remaining (use sell_date as buy_date for new)
+            if shares_sold < total_shares:
+                remaining_shares = float(total_shares - shares_sold)
+                orig_pos_id = position_id if new_profit_position else None
+                add_position(
+                    account=orig['account'], ticker=orig['ticker'], buy_date=sell_date,
+                    invested_amount=remaining_invested, shares=remaining_shares,
+                    notes=orig['notes'], profit_position=new_profit_position,
+                    original_position_id=orig_pos_id
+                )
+
+            # Delete original open_position
+            conn.execute(sa.text("DELETE FROM stocks.public.open_positions WHERE id = :id;"), {
+                         'id': position_id})
+
+
+# Sell Recommendations section (updated with original_position_id from view)
+st.header("Sell Recommendations")
+sell_df = pd.read_sql(
+    "SELECT * FROM stocks.public.sell_recommendations ORDER BY account, ticker;", engine)
+if not sell_df.empty:
+    st.dataframe(sell_df)
+
+    # Options include position_id and buy_date for uniqueness
+    rec_options = [
+        f"{row['account']} - {row['ticker']} (ID: {row['original_position_id']}, Buy Date: {row['buy_date']})" for _, row in sell_df.iterrows()]
+    selected_rec = st.selectbox(
+        "Select Recommendation to Sell", options=rec_options, index=0)
+    if st.button("Proceed to Sell for Selected"):
+        if selected_rec:
+            import re
+            match = re.match(
+                r"(.+) - (.+) \(ID: (\d+), Buy Date: (.+)\)", selected_rec)
+            if match:
+                account, ticker, pos_id, buy_date_str = match.groups()
+                st.session_state.sell_account = account
+                st.session_state.sell_ticker = ticker
+                st.session_state.sell_position_id = int(pos_id)
+                st.session_state.sell_buy_date = buy_date_str  # Optional, for display
+                st.success(
+                    f"Pre-filled Sell Position with {account} - {ticker} (ID: {pos_id}). Scroll down to complete.")
+else:
+    st.info("No sell recommendations at this time.")
+
+# Sell Position section (always allow manual selection, pre-fill if from rec)
+st.header("Sell Position")
+
+# Fetch all open positions for manual selection
+open_positions_df = pd.read_sql(
+    "SELECT id, account, ticker, buy_date, invested_amount, shares, profit_position FROM stocks.public.open_positions ORDER BY account, ticker, buy_date;", engine)
+
+if not open_positions_df.empty:
+    # Create options
+    pos_options = [
+        f"{row['account']} - {row['ticker']} (ID: {row['id']}, Buy Date: {row['buy_date']})" for _, row in open_positions_df.iterrows()]
+
+    # Find index if pre-filled
+    pre_position_id = st.session_state.get('sell_position_id', None)
+    default_index = 0
+    if pre_position_id:
+        for idx, row in open_positions_df.iterrows():
+            if row['id'] == pre_position_id:
+                default_index = idx
+                break
+
+    selected_pos = st.selectbox(
+        "Select Position to Sell", pos_options, index=default_index)
+
+    if selected_pos:
+        import re
+        match = re.match(
+            r"(.+) - (.+) \(ID: (\d+), Buy Date: (.+)\)", selected_pos)
+        if match:
+            account, ticker, pos_id_str, buy_date_str = match.groups()
+            position_id = int(pos_id_str)
+
+            # Fetch details for the selected position
+            orig = open_positions_df[open_positions_df['id']
+                                     == position_id].iloc[0]
+            total_shares = orig['shares']
+            st.info(
+                f"Selected Position: {account} - {ticker} | Buy Date: {buy_date_str} | Shares: {total_shares} | Invested: ${orig['invested_amount']:.2f} | Profit Position: {orig['profit_position']}")
+
+            sell_date = st.date_input("Sell Date", value=date.today())
+            sell_amount = st.number_input(
+                "Sell Amount ($)", min_value=0.0, step=0.01)
+            shares_sold = st.number_input(
+                "Shares Sold", min_value=0.0, max_value=total_shares, step=0.01)
+            if st.button("Confirm Sell"):
+                if sell_amount > 0 and 0 < shares_sold <= total_shares:
+                    try:
+                        sell_position(position_id, sell_date,
+                                      sell_amount, shares_sold)
+                        st.success(
+                            f"Sold {shares_sold} shares of {ticker} for ${sell_amount:.2f}")
+                        # Clear pre-fill
+                        st.session_state.pop('sell_account', None)
+                        st.session_state.pop('sell_ticker', None)
+                        st.session_state.pop('sell_position_id', None)
+                        st.session_state.pop('sell_buy_date', None)
+                        st.rerun()  # Refresh
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                else:
+                    st.error(
+                        "Please enter valid sell amount and shares (cannot exceed total shares).")
+else:
+    st.info("No open positions available to sell.")
 
 # Fetch exclusions
 
